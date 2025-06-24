@@ -1,0 +1,50 @@
+#!/bin/bash
+
+echo "🔍 键盘调试工具"
+echo ""
+echo "用于测试不同控制键的 ASCII 码"
+echo ""
+
+# 设置环境变量
+export ANTHROPIC_API_KEY="sk-ant-api03-ktEIQRrNpc9FHsUEoLEpTKderUQevFdMBjWfTV2bZGCm751pi326ji2ur_IuG4OuSgj3sbvcVfQYx-fzrQ3bHXA-4Bz_DgAA"
+
+go build -o xsh .
+
+echo "📋 常用控制键 ASCII 码："
+echo "   Ctrl+A = 1"
+echo "   Ctrl+B = 2"
+echo "   Ctrl+C = 3"
+echo "   Ctrl+D = 4"
+echo "   Ctrl+E = 5"
+echo "   Ctrl+F = 6"
+echo "   Ctrl+G = 7"
+echo "   Ctrl+H = 8"
+echo "   Ctrl+I = 9 (Tab)"
+echo "   Ctrl+J = 10"
+echo "   Ctrl+K = 11"
+echo "   Ctrl+L = 12"
+echo "   Ctrl+M = 13 (Enter)"
+echo "   Ctrl+N = 14"
+echo "   Ctrl+O = 15"
+echo "   Ctrl+P = 16"
+echo "   Ctrl+Q = 17"
+echo "   Ctrl+R = 18"
+echo "   Ctrl+S = 19"
+echo "   Ctrl+T = 20"
+echo "   Ctrl+U = 21"
+echo "   Ctrl+V = 22"
+echo "   Ctrl+W = 23"
+echo "   Ctrl+X = 24"
+echo "   Ctrl+Y = 25"
+echo "   Ctrl+Z = 26"
+echo ""
+
+echo "🎯 测试建议："
+echo "1. 尝试 Ctrl+T (ASCII 20) - 通常不被终端特殊处理"
+echo "2. 尝试 Ctrl+R (ASCII 18) - 在某些终端可用"
+echo "3. 尝试 Ctrl+Y (ASCII 25) - 通常可用"
+echo "4. 如果都不行，使用 'm' + Tab 或 'o' + Tab"
+echo ""
+
+echo "启动 xsh 测试："
+echo "./xsh" 
