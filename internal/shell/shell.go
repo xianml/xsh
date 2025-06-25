@@ -1,493 +1,403 @@
 package shell
 
 import (
+	"context"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"os/signal"
-	"strconv"
+	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"syscall"
+	"time"
 
-	"github.com/xian/xsh/internal/ai"
-	"github.com/xian/xsh/internal/config"
+	"golang.org/x/term"
 
-	"github.com/chzyer/readline"
+	"github.com/creack/pty"
 	"github.com/fatih/color"
 	"github.com/manifoldco/promptui"
+	"github.com/xian/xsh/internal/ai"
+	"github.com/xian/xsh/internal/config"
 )
 
 type Shell struct {
 	config *config.Config
 	ai     *ai.Client
-	rl     *readline.Instance
 	colors struct {
 		Prompt   *color.Color
 		Command  *color.Color
 		Response *color.Color
 		Error    *color.Color
 	}
-	// 状态管理
-	modelSelectorTriggered    bool
-	commandExecutionTriggered bool
-	pendingCommands           []string
-	inputChannel              chan string
-}
-
-// 内置别名映射
-var builtinAliases = map[string]string{
-	"ll":    "ls -lh",
-	"la":    "ls -la",
-	"l":     "ls",
-	"grep":  "grep --color=auto",
-	"egrep": "egrep --color=auto",
-	"fgrep": "fgrep --color=auto",
+	ptmx         *os.File
+	ctx          context.Context
+	cancel       context.CancelFunc
+	aiHookActive atomic.Bool
 }
 
 func NewShell(cfg *config.Config) (*Shell, error) {
-	aiClient := ai.New(cfg)
-
-	rl, err := readline.New("")
-	if err != nil {
-		return nil, err
-	}
-
+	ctx, cancel := context.WithCancel(context.Background())
 	shell := &Shell{
-		config:       cfg,
-		ai:           aiClient,
-		rl:           rl,
-		inputChannel: make(chan string, 1),
+		config: cfg,
+		ai:     ai.New(cfg),
+		ctx:    ctx,
+		cancel: cancel,
 	}
-
-	// 设置颜色
 	shell.colors.Prompt = color.New(color.FgCyan, color.Bold)
 	shell.colors.Command = color.New(color.FgGreen)
 	shell.colors.Response = color.New(color.FgYellow)
 	shell.colors.Error = color.New(color.FgRed)
-
 	return shell, nil
 }
 
 func (s *Shell) Run() error {
-	defer s.rl.Close()
+	defer s.cancel() // Ensure all goroutines are signaled to stop on exit
 
-	// 设置信号处理
-	s.setupSignalHandlers()
-
-	fmt.Println(s.colors.Prompt.Sprint("Welcome to xsh - AI Powered Shell"))
-	fmt.Printf("%s Available models: %v (current: %s)\n",
-		s.colors.Prompt.Sprint("🤖"),
-		s.ai.GetAvailableModels(),
-		s.ai.GetCurrentModel())
-	fmt.Println(s.colors.Prompt.Sprint("Keyboard Shortcuts:"))
-	fmt.Println(s.colors.Response.Sprint("  - Tab (empty input): Select AI model (↑↓ + Enter)"))
-	fmt.Println(s.colors.Response.Sprint("  - Tab (with input): AI assistance"))
-	fmt.Println(s.colors.Response.Sprint("  - 'm' or 'models': Select AI model"))
-	fmt.Println(s.colors.Response.Sprint("  - Ctrl+C: Cancel current line"))
-	fmt.Println(s.colors.Response.Sprint("  - 'exit': Quit xsh"))
+	logo := `
+██╗  ██╗███████╗██╗  ██╗
+╚██╗██╔╝██╔════╝██║  ██║
+ ╚███╔╝ ███████╗███████║
+ ██╔██╗ ╚════██║██╔══██║
+██╔╝ ██╗███████║██║  ██║
+╚═╝  ╚═╝╚══════╝╚═╝  ╚═╝
+`
+	s.colors.Command.Println(logo)
+	s.colors.Command.Println("Welcome to xsh - Your AI-Enhanced Shell")
 	fmt.Println()
 
-	// 使用自定义输入循环处理键盘事件
-	return s.inputLoop()
-}
-
-// 创建能捕获键盘事件的补全器
-func (s *Shell) createKeyEventCompleter() readline.AutoCompleter {
-	return readline.NewPrefixCompleter(
-		readline.PcItemDynamic(func(line string) []string {
-			trimmed := strings.TrimSpace(line)
-
-			// 如果没有输入内容，Tab 键触发模型选择
-			if trimmed == "" {
-				// 直接在这里处理模型选择，不使用异步
-				fmt.Printf("\n")
-				s.handleModelSelectorWithArrows()
-				return []string{} // 不显示任何补全建议
-			}
-
-			// 如果有输入内容，Tab 键触发 AI 分析
-			fmt.Printf("\n🤖 Analyzing: %s\n", line)
-			s.handleAIPrompt(line)
-			fmt.Print(s.colors.Prompt.Sprint("xsh> "))
-			return []string{} // 不显示任何补全建议
-		}),
-	)
-}
-
-// 使用箭头键选择模型
-func (s *Shell) handleModelSelectorWithArrows() {
-	fmt.Println("🔄 Getting available models...")
-	modelInfos := s.ai.GetAvailableModelInfos()
-	currentModel := s.ai.GetCurrentModel()
-
-	if len(modelInfos) == 0 {
-		s.colors.Error.Println("No models available. Please check your API keys.")
-		fmt.Print(s.colors.Prompt.Sprint("xsh> "))
-		return
-	}
-
-	// 准备选项列表
-	var items []string
-	var selectedIndex int
-	for i, info := range modelInfos {
-		label := fmt.Sprintf("%s (%s)", info.DisplayName, info.Provider)
-		if info.DisplayName == currentModel {
-			label += " (current)"
-			selectedIndex = i
-		}
-		items = append(items, label)
-	}
-
-	// 创建箭头键选择器
-	prompt := promptui.Select{
-		Label:     "Select AI Model",
-		Items:     items,
-		CursorPos: selectedIndex,
-		Size:      10,
-		Templates: &promptui.SelectTemplates{
-			Label:    "{{ . }}:",
-			Active:   "▸ {{ . | cyan }}",
-			Inactive: "  {{ . }}",
-			Selected: "✓ {{ . | green }}",
-		},
-	}
-
-	idx, _, err := prompt.Run()
+	// Create a temporary directory for IPC
+	ipcDir, err := os.MkdirTemp("", "xsh-ipc")
 	if err != nil {
-		if err == promptui.ErrInterrupt {
-			fmt.Print(s.colors.Prompt.Sprint("xsh> "))
-			return
-		}
-		s.colors.Error.Printf("Selection failed: %v\n", err)
-		fmt.Print(s.colors.Prompt.Sprint("xsh> "))
-		return
+		return fmt.Errorf("failed to create IPC temp dir: %w", err)
+	}
+	defer os.RemoveAll(ipcDir)
+	promptPipePath := filepath.Join(ipcDir, "prompt_pipe")
+	resultPipePath := filepath.Join(ipcDir, "result_pipe")
+
+	// Create the named pipes (FIFO)
+	if err := syscall.Mkfifo(promptPipePath, 0600); err != nil {
+		return fmt.Errorf("failed to create prompt pipe: %w", err)
+	}
+	if err := syscall.Mkfifo(resultPipePath, 0600); err != nil {
+		return fmt.Errorf("failed to create result pipe: %w", err)
 	}
 
-	// 切换到选择的模型
-	selectedInfo := modelInfos[idx]
-	if err := s.ai.SwitchModelByDisplayName(selectedInfo.DisplayName, selectedInfo.Provider); err != nil {
-		s.colors.Error.Printf("Failed to switch model: %v\n", err)
-	} else {
-		s.colors.Command.Printf("Switched to model: %s (%s)\n", selectedInfo.DisplayName, selectedInfo.Provider)
+	userShell := os.Getenv("SHELL")
+	if userShell == "" {
+		userShell = "/bin/zsh" // Default to zsh
 	}
+	shellName := filepath.Base(userShell)
 
-	fmt.Print(s.colors.Prompt.Sprint("xsh> "))
-}
-
-func (s *Shell) inputLoop() error {
-	for {
-		// 使用特殊的补全器来捕获键盘事件
-		s.rl.Config.AutoComplete = s.createKeyEventCompleter()
-		s.rl.SetPrompt(s.colors.Prompt.Sprint("xsh> "))
-
-		line, err := s.rl.Readline()
-		if err != nil {
-			if err == readline.ErrInterrupt {
-				// Ctrl+C 按下，取消当前行
-				fmt.Println("^C")
-				s.modelSelectorTriggered = false    // 重置状态
-				s.commandExecutionTriggered = false // 重置命令执行状态
-				s.rl.SetPrompt(s.colors.Prompt.Sprint("xsh> "))
-				s.rl.Refresh()
-				continue
-			} else if err.Error() == "EOF" {
-				break
-			}
-			return err
-		}
-
-		line = strings.TrimSpace(line)
-
-		// 如果正在等待模型选择
-		if s.modelSelectorTriggered {
-			s.handleModelSelection(line)
-			continue
-		}
-
-		// 如果正在等待命令执行选择
-		if s.commandExecutionTriggered {
-			s.handleCommandExecution(line)
-			continue
-		}
-
-		// 检查是否是模型选择命令
-		if line == "m" || line == "models" {
-			s.showModelSelectorWithArrows()
-			continue
-		}
-
-		if line == "" {
-			continue
-		}
-
-		if line == "exit" {
-			break
-		}
-
-		if strings.HasPrefix(line, "ai ") {
-			prompt := strings.TrimPrefix(line, "ai ")
-			s.handleAIPrompt(prompt)
-			continue
-		}
-
-		// 执行命令
-		s.executeCommand(line)
-	}
-
-	return nil
-}
-
-// 使用箭头键的模型选择器（用于 'm' 命令）
-func (s *Shell) showModelSelectorWithArrows() {
-	fmt.Println("🔄 Getting available models...")
-	modelInfos := s.ai.GetAvailableModelInfos()
-	currentModel := s.ai.GetCurrentModel()
-
-	if len(modelInfos) == 0 {
-		s.colors.Error.Println("No models available. Please check your API keys.")
-		return
-	}
-
-	// 准备选项列表
-	var items []string
-	var selectedIndex int
-	for i, info := range modelInfos {
-		label := fmt.Sprintf("%s (%s)", info.DisplayName, info.Provider)
-		if info.DisplayName == currentModel {
-			label += " (current)"
-			selectedIndex = i
-		}
-		items = append(items, label)
-	}
-
-	// 创建箭头键选择器
-	prompt := promptui.Select{
-		Label:     "Select AI Model",
-		Items:     items,
-		CursorPos: selectedIndex,
-		Size:      10,
-		Templates: &promptui.SelectTemplates{
-			Label:    "{{ . }}:",
-			Active:   "▸ {{ . | cyan }}",
-			Inactive: "  {{ . }}",
-			Selected: "✓ {{ . | green }}",
-		},
-	}
-
-	idx, _, err := prompt.Run()
+	// Create a temporary directory for shell startup files
+	zdotdir, err := os.MkdirTemp("", "xsh-zdotdir")
 	if err != nil {
-		if err == promptui.ErrInterrupt {
-			return
-		}
-		s.colors.Error.Printf("Selection failed: %v\n", err)
-		return
+		return fmt.Errorf("failed to create zdotdir: %w", err)
+	}
+	defer os.RemoveAll(zdotdir)
+
+	// Create and write the shell-specific startup script with the hook
+	if err := s.createInitScript(shellName, zdotdir, promptPipePath, resultPipePath); err != nil {
+		return fmt.Errorf("failed to create shell init script: %w", err)
 	}
 
-	// 切换到选择的模型
-	selectedInfo := modelInfos[idx]
-	if err := s.ai.SwitchModelByDisplayName(selectedInfo.DisplayName, selectedInfo.Provider); err != nil {
-		s.colors.Error.Printf("Failed to switch model: %v\n", err)
-	} else {
-		s.colors.Command.Printf("Switched to model: %s (%s)\n", selectedInfo.DisplayName, selectedInfo.Provider)
-	}
-	fmt.Println()
-}
-
-// 处理模型选择输入 - 现在不再使用，保留以防回退
-func (s *Shell) handleModelSelection(input string) {
-	s.modelSelectorTriggered = false // 重置状态
-
-	if input == "" {
-		fmt.Println() // 空行
-		return
+	var c *exec.Cmd
+	switch shellName {
+	case "zsh":
+		c = exec.Command(userShell, "-l")
+		c.Env = append(os.Environ(), "ZDOTDIR="+zdotdir)
+	case "bash":
+		bashrcPath := filepath.Join(zdotdir, ".bashrc")
+		c = exec.Command(userShell, "--rcfile", bashrcPath, "-i")
+	default:
+		// For unsupported shells, just run them without hooks
+		c = exec.Command(userShell, "-l")
 	}
 
-	modelInfos := s.ai.GetAvailableModelInfos()
-	if idx := s.parseChoice(input); idx > 0 && idx <= len(modelInfos) {
-		selectedInfo := modelInfos[idx-1]
-		if err := s.ai.SwitchModelByDisplayName(selectedInfo.DisplayName, selectedInfo.Provider); err != nil {
-			s.colors.Error.Printf("Failed to switch model: %v\n", err)
-		} else {
-			s.colors.Command.Printf("Switched to model: %s (%s)\n", selectedInfo.DisplayName, selectedInfo.Provider)
-		}
-	} else {
-		s.colors.Error.Println("Invalid choice")
+	s.ptmx, err = pty.Start(c)
+	if err != nil {
+		return fmt.Errorf("failed to start pty: %w", err)
 	}
-	fmt.Println()
-}
+	defer s.ptmx.Close()
 
-// 处理命令执行选择输入 - 现在不再使用，保留以防回退
-func (s *Shell) handleCommandExecution(input string) {
-	s.commandExecutionTriggered = false // 重置状态
-
-	if input == "" {
-		fmt.Println() // 空行
-		return
-	}
-
-	choice := strings.TrimSpace(input)
-
-	if choice == "y" && len(s.pendingCommands) > 0 {
-		s.executeCommand(s.pendingCommands[0])
-	} else if idx := s.parseChoice(choice); idx > 0 && idx <= len(s.pendingCommands) {
-		s.executeCommand(s.pendingCommands[idx-1])
-	} else if choice != "n" && choice != "" {
-		s.colors.Error.Println("Invalid choice")
-	}
-
-	s.pendingCommands = nil // 清空待执行命令
-	fmt.Println()
-}
-
-// 异步处理模型选择器 - 现在不再使用
-func (s *Shell) handleModelSelectorAsync() {
-	// 这个函数保留但不再使用
-}
-
-// 保留原来的模型选择器
-func (s *Shell) showModelSelector() {
-	s.showModelSelectorWithArrows()
-}
-
-func (s *Shell) parseChoice(choice string) int {
-	// 尝试解析为数字
-	if idx, err := strconv.Atoi(choice); err == nil {
-		return idx
-	}
-	return 0
-}
-
-func (s *Shell) setupSignalHandlers() {
-	c := make(chan os.Signal, 1)
-	signal.Notify(c, os.Interrupt, syscall.SIGTERM)
+	// Handle window size changes
+	ch := make(chan os.Signal, 1)
+	signal.Notify(ch, syscall.SIGWINCH)
 	go func() {
-		<-c
-		s.rl.Close()
-		os.Exit(0)
+		for {
+			select {
+			case <-ch:
+				if err := pty.InheritSize(os.Stdin, s.ptmx); err != nil {
+					// This can happen if the PTY is already closed.
+				}
+			case <-s.ctx.Done():
+				return
+			}
+		}
 	}()
+	ch <- syscall.SIGWINCH // Initial size
+	defer signal.Stop(ch)
+	defer close(ch)
+
+	// Set stdin to raw mode
+	oldState, err := term.MakeRaw(int(os.Stdin.Fd()))
+	if err != nil {
+		return fmt.Errorf("failed to set stdin to raw mode: %w", err)
+	}
+	defer term.Restore(int(os.Stdin.Fd()), oldState)
+
+	// === Set up Shell Integration ===
+	// Start a goroutine to listen for AI commands from the shell hook
+	go s.commandServer(promptPipePath, resultPipePath, oldState)
+
+	// === Correct Lifecycle Management ===
+	// Goroutine for handling shell output. This is the primary signal for shutdown.
+	errChan := make(chan error, 1)
+	go func() {
+		_, err := io.Copy(os.Stdout, s.ptmx)
+		errChan <- err
+	}()
+
+	// Goroutine for handling user input.
+	go s.handleInput()
+
+	// Wait for the shell to exit.
+	err = <-errChan
+	if err != nil && err.Error() == "EOF" {
+		// This is a normal exit.
+		return nil
+	}
+	return err
 }
 
-func (s *Shell) executeCommand(cmd string) {
-	// 预处理别名
-	parts := strings.Fields(cmd)
-	if len(parts) > 0 {
-		if alias, exists := builtinAliases[parts[0]]; exists {
-			// 替换别名
-			aliasParts := strings.Fields(alias)
-			newParts := append(aliasParts, parts[1:]...)
-			cmd = strings.Join(newParts, " ")
+func (s *Shell) handleInput() {
+	buf := make([]byte, 1024)
+	for {
+		select {
+		case <-s.ctx.Done():
+			return
+		default:
+			// If the AI hook is active, pause input forwarding to avoid race conditions.
+			if s.aiHookActive.Load() {
+				time.Sleep(10 * time.Millisecond)
+				continue
+			}
+
+			n, err := os.Stdin.Read(buf)
+			if err != nil {
+				return // Can happen on exit
+			}
+			if _, wErr := s.ptmx.Write(buf[:n]); wErr != nil {
+				return // Can happen if PTY is closed
+			}
 		}
 	}
-
-	fmt.Printf("%s %s\n", s.colors.Command.Sprint("$"), cmd)
-
-	// 执行命令
-	execCmd := exec.Command("zsh", "-c", cmd)
-	execCmd.Stdin = os.Stdin
-	execCmd.Stdout = os.Stdout
-	execCmd.Stderr = os.Stderr
-
-	if err := execCmd.Run(); err != nil {
-		s.colors.Error.Printf("Command failed: %v\n", err)
-	}
-	fmt.Println()
 }
 
-func (s *Shell) handleAIPrompt(prompt string) {
-	s.colors.Response.Println("🤖 Asking AI...")
+func (s *Shell) createInitScript(shellName, zdotdir, promptPipePath, resultPipePath string) error {
+	homeDir, err := os.UserHomeDir()
+	if err != nil {
+		return fmt.Errorf("could not get user home directory: %w", err)
+	}
 
-	response, err := s.ai.Query(prompt)
+	var scriptPath, userRcPath, scriptContent string
+	hook := ""
+
+	switch shellName {
+	case "zsh":
+		scriptPath = filepath.Join(zdotdir, ".zshrc")
+		userRcPath = filepath.Join(homeDir, ".zshrc")
+		hook = fmt.Sprintf(`xsh_ai_widget() { local p_pipe=%q; local r_pipe=%q; local res; echo -n "$BUFFER" > "$p_pipe"; read -r res < "$r_pipe"; if [[ -n "$res" ]]; then BUFFER=$res; CURSOR=${#res}; fi; zle redisplay; }; zle -N xsh_ai_widget; bindkey '^I' xsh_ai_widget`, promptPipePath, resultPipePath)
+	case "bash":
+		scriptPath = filepath.Join(zdotdir, ".bashrc")
+		userRcPath = filepath.Join(homeDir, ".bashrc")
+		hook = `bind -x '"\t": "echo -e \"\n\x1b[31mxsh: Full AI support is only available for zsh.\x1b[0m\""'`
+	default:
+		return nil // No script for unsupported shells
+	}
+
+	// Safely source the user's original rc file if it exists
+	scriptContent = fmt.Sprintf(`
+# xsh startup script
+if [ -f %q ]; then
+  source %q
+fi
+
+# xsh keybinding hook
+%s
+`, userRcPath, userRcPath, hook)
+
+	return os.WriteFile(scriptPath, []byte(scriptContent), 0600)
+}
+
+func (s *Shell) commandServer(promptPipePath, resultPipePath string, originalState *term.State) {
+	for {
+		select {
+		case <-s.ctx.Done():
+			return
+		default:
+		}
+
+		promptPipe, err := os.OpenFile(promptPipePath, os.O_RDONLY, 0600)
+		if err != nil {
+			if s.ctx.Err() != nil {
+				return
+			}
+			time.Sleep(100 * time.Millisecond)
+			continue
+		}
+
+		userInput, err := io.ReadAll(promptPipe)
+		promptPipe.Close()
+		if err != nil {
+			if s.ctx.Err() != nil {
+				return
+			}
+			continue
+		}
+
+		selectedCommand := s.triggerAIHook(userInput, originalState)
+
+		resultPipe, err := os.OpenFile(resultPipePath, os.O_WRONLY, 0600)
+		if err != nil {
+			continue // Shell might have already aborted waiting
+		}
+		// Write result, even if empty (for cancellation), so the shell unblocks.
+		_, _ = resultPipe.Write([]byte(selectedCommand))
+		resultPipe.Close()
+	}
+}
+
+func (s *Shell) triggerAIHook(bufferSnapshot []byte, originalState *term.State) string {
+	s.aiHookActive.Store(true)
+	defer s.aiHookActive.Store(false)
+
+	// Correctly manage terminal state transitions for promptui
+	term.Restore(int(os.Stdin.Fd()), originalState)
+	defer term.MakeRaw(int(os.Stdin.Fd()))
+
+	userInput := string(bufferSnapshot)
+	if len(userInput) == 0 {
+		s.handleModelSelection()
+		return "" // Model selection does not return a command
+	} else {
+		return s.handleAIAnalysis(userInput)
+	}
+}
+
+func (s *Shell) handleModelSelection() {
+	modelInfos := s.ai.GetAvailableModelInfos()
+	if len(modelInfos) == 0 {
+		s.colors.Error.Println("No models available.")
+		return
+	}
+
+	var items []string
+	selectedIndex := 0
+	currentModel := s.ai.GetCurrentModel()
+	for i, info := range modelInfos {
+		if info.DisplayName == currentModel {
+			selectedIndex = i
+		}
+		items = append(items, fmt.Sprintf("%s (%s)", info.DisplayName, info.Provider))
+	}
+
+	prompt := promptui.Select{
+		Label:     "Select AI Model",
+		Items:     items,
+		CursorPos: selectedIndex,
+		Size:      10,
+	}
+
+	idx, _, err := prompt.Run()
+	if err != nil {
+		return // User cancelled
+	}
+
+	selectedInfo := modelInfos[idx]
+	if err := s.ai.SwitchModelByDisplayName(selectedInfo.DisplayName, selectedInfo.Provider); err != nil {
+		s.colors.Error.Printf("Failed to switch model: %v\n", err)
+	} else {
+		s.colors.Command.Printf("Switched to model: %s (%s)\n", selectedInfo.DisplayName, selectedInfo.Provider)
+	}
+}
+
+func (s *Shell) handleAIAnalysis(userInput string) string {
+	s.colors.Response.Println("\n🤖 Asking AI for:", userInput)
+	response, err := s.ai.Query(userInput)
 	if err != nil {
 		s.colors.Error.Printf("AI error: %v\n", err)
-		return
+		return ""
 	}
 
-	// 解析 AI 响应寻找建议的命令
-	suggestions := s.parseAISuggestions(response)
+	userMessage, suggestions := parseAIResponse(response)
 
-	if len(suggestions) > 0 {
-		fmt.Println("AI suggests the following commands:")
-		for i, suggestion := range suggestions {
-			s.colors.Command.Printf("%d. %s\n", i+1, suggestion)
-		}
-
-		// 使用箭头键选择是否执行命令
-		s.handleCommandExecutionWithArrows(suggestions)
-	} else {
-		// 如果没有找到命令建议，就显示原始响应
-		s.colors.Response.Println(response)
-		fmt.Println()
-	}
-}
-
-// 使用箭头键选择是否执行命令
-func (s *Shell) handleCommandExecutionWithArrows(commands []string) {
-	// 准备选项
-	var items []string
-	items = append(items, "No, don't execute any command")
-	for _, cmd := range commands {
-		items = append(items, fmt.Sprintf("Execute: %s", cmd))
+	if len(suggestions) == 0 {
+		s.colors.Response.Println("AI:", response) // Show raw response if parsing fails
+		return ""
 	}
 
-	// 创建箭头键选择器
+	if userMessage != "" {
+		s.colors.Prompt.Println("💡", userMessage)
+	}
+
+	items := append([]string{"[ Cancel ]"}, suggestions...)
+
 	prompt := promptui.Select{
-		Label: "Execute command?",
+		Label: "Do you want to execute one of these commands?",
 		Items: items,
-		Size:  len(items),
-		Templates: &promptui.SelectTemplates{
-			Label:    "{{ . }}:",
-			Active:   "▸ {{ . | cyan }}",
-			Inactive: "  {{ . }}",
-			Selected: "✓ {{ . | green }}",
-		},
+		Size:  10,
 	}
 
 	idx, _, err := prompt.Run()
-	if err != nil {
-		if err == promptui.ErrInterrupt {
-			fmt.Println()
-			return
-		}
-		s.colors.Error.Printf("Selection failed: %v\n", err)
-		return
+	if err != nil || idx == 0 {
+		return "" // User cancelled or chose not to execute
 	}
 
-	// 如果选择了执行命令（不是第一个"No"选项）
-	if idx > 0 {
-		s.executeCommand(commands[idx-1])
-	}
+	commandToExecute := suggestions[idx-1]
 
-	fmt.Println()
+	// The selected command is returned to the shell hook for execution.
+	// The promptui library itself shows the final selection, so no extra printing is needed.
+	return commandToExecute
 }
 
-func (s *Shell) parseAISuggestions(response string) []string {
-	var suggestions []string
-	lines := strings.Split(response, "\n")
+// parseAIResponse parses the structured response from the AI.
+func parseAIResponse(response string) (userMessage string, commands []string) {
+	const userMsgPrefix = "USER_MESSAGE:"
+	const shellCmdPrefix = "SHELL_COMMANDS:"
 
-	for _, line := range lines {
-		line = strings.TrimSpace(line)
-		// 寻找看起来像命令的行
-		if strings.HasPrefix(line, "1. ") || strings.HasPrefix(line, "2. ") ||
-			strings.HasPrefix(line, "3. ") || strings.HasPrefix(line, "4. ") ||
-			strings.HasPrefix(line, "- ") {
-			// 提取命令部分
-			parts := strings.SplitN(line, " ", 2)
-			if len(parts) > 1 {
-				cmd := parts[1]
-				// 清理命令中的注释
-				if idx := strings.Index(cmd, " #"); idx != -1 {
-					cmd = cmd[:idx]
-				}
-				if idx := strings.Index(cmd, "   #"); idx != -1 {
-					cmd = cmd[:idx]
-				}
-				cmd = strings.TrimSpace(cmd)
-				if cmd != "" {
-					suggestions = append(suggestions, cmd)
-				}
-			}
+	shellCmdStart := strings.Index(response, shellCmdPrefix)
+	if shellCmdStart == -1 {
+		return "", nil // No commands found, parsing failed.
+	}
+
+	userMsgStart := strings.Index(response, userMsgPrefix)
+	if userMsgStart != -1 && userMsgStart < shellCmdStart {
+		userMessage = strings.TrimSpace(response[userMsgStart+len(userMsgPrefix) : shellCmdStart])
+	}
+
+	cmdBlock := strings.TrimSpace(response[shellCmdStart+len(shellCmdPrefix):])
+	cmdLines := strings.Split(cmdBlock, "\n")
+	for _, cmd := range cmdLines {
+		if trimmed := strings.TrimSpace(cmd); trimmed != "" {
+			commands = append(commands, trimmed)
 		}
 	}
 
-	return suggestions
+	return userMessage, commands
+}
+
+func (s *Shell) Goodbye() {
+	// Add a newline to ensure the art starts on a fresh line
+	fmt.Println()
+	byeArt := `
+██████╗ ██╗   ██╗███████╗
+██╔══██╗╚██╗ ██╔╝██╔════╝
+██████╔╝ ╚████╔╝ █████╗  
+██╔══██╗  ╚██╔╝  ██╔══╝  
+██████╔╝   ██║   ███████╗
+╚═════╝    ╚═╝   ╚══════╝
+`
+	s.colors.Prompt.Println(byeArt)
 }
